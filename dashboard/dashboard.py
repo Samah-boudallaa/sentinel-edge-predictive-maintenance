@@ -2,6 +2,7 @@ import html
 import os
 import time
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -12,21 +13,22 @@ import streamlit as st
 import streamlit.components.v1 as components
 from sklearn.ensemble import IsolationForest
 
+from diagnostics import COMPONENTS, cusum, diagnose, reference, rul_estimate
+
 st.set_page_config(page_title="SentinelEdge", layout="wide", initial_sidebar_state="expanded")
 
 COLS = ["ms", "mode", "std_g", "p2p_g", "ratio", "freq_hz", "niveau"]
 RATIO_ZERO = 8.0
 RANK = {"NORMAL": 0, "ATTENTION": 1, "CRITIQUE": 2}
+LEVEL_EN = {"NORMAL": "Normal", "ATTENTION": "Attention", "CRITIQUE": "Critical"}
 API_DEFAULT = os.environ.get("SENTINEL_API_URL", "http://localhost:8000")
 STALE_S = 10.0
 PAGES = ["Overview", "Live Telemetry", "AI Diagnostics", "Event History", "API & Database", "Settings"]
 SRC_DEMO, SRC_CSV, SRC_API = "Démonstration", "Fichier CSV", "API (SQLite)"
 SIM_MODES = ["Normal", "Instable", "Panne", "Dérive progressive"]
 RANGES = {"Tout": None, "1 h": 3600, "6 h": 21600, "24 h": 86400, "7 j": 604800}
-LEVEL_LABEL = {"NORMAL": "NORMAL", "ATTENTION": "ATTENTION", "CRITIQUE": "CRITIQUE"}
-
-
-# Thèmes
+TWIN_DIR = Path(__file__).parent / "twin_component"
+_twin = components.declare_component("sentinel_twin", path=str(TWIN_DIR)) if TWIN_DIR.exists() else None
 
 THEMES = {
     "Midnight": dict(bg="#050816", glow1="#1a1148", glow2="#0a2a44", side="#080D1B", panel="rgba(11,18,36,.82)",
@@ -45,14 +47,10 @@ THEMES = {
 }
 
 ss = st.session_state
-ss.setdefault("pos", 12)
-ss.setdefault("play", True)
-ss.setdefault("last_level", None)
-ss.setdefault("sim", "Dérive progressive")
+for k_, v_ in dict(pos=12, play=True, last_level=None, sim="Dérive progressive", api_ok=None,
+                   api_last_ms=None, api_last_change=time.time()).items():
+    ss.setdefault(k_, v_)
 ss.setdefault("acked", set())
-ss.setdefault("api_ok", None)
-ss.setdefault("api_last_ms", None)
-ss.setdefault("api_last_change", time.time())
 
 # ----------------------------------------------------------------------------
 # Barre latérale : marque, navigation, thème
@@ -60,12 +58,10 @@ ss.setdefault("api_last_change", time.time())
 st.sidebar.markdown("<div class='brand-s'>SENTINELEDGE</div><div class='brand-sub'>Predictive Maintenance</div>",
                     unsafe_allow_html=True)
 page = st.sidebar.radio("Navigation", PAGES, label_visibility="collapsed")
-
 names = list(THEMES)
-qp_theme = st.query_params.get("theme")
-theme = st.sidebar.radio("Thème", names, index=names.index(qp_theme) if qp_theme in names else 0,
-                         horizontal=True)
-if qp_theme != theme:
+qp = st.query_params.get("theme")
+theme = st.sidebar.radio("Thème", names, index=names.index(qp) if qp in names else 0, horizontal=True)
+if qp != theme:
     st.query_params["theme"] = theme
 T = THEMES[theme]
 LV = {"NORMAL": T["good"], "ATTENTION": T["warn"], "CRITIQUE": T["bad"]}
@@ -105,7 +101,6 @@ section[data-testid="stSidebar"]{background:var(--side)!important;border-right:1
 .stApp .brand-sub{color:var(--muted)!important;font-size:.78rem;letter-spacing:.14em;text-transform:uppercase;margin-bottom:10px}
 .stApp .tagline{border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-top:22px;
  background:linear-gradient(135deg,var(--panel2),transparent);color:var(--muted)!important;font-size:.85rem;font-style:italic}
-
 .stApp .topbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between;
  padding:12px 18px;margin-bottom:12px;border:1px solid var(--line);border-radius:12px;background:var(--panel);
  box-shadow:var(--shadow);backdrop-filter:blur(10px)}
@@ -115,8 +110,6 @@ section[data-testid="stSidebar"]{background:var(--side)!important;border-right:1
 .stApp .chip b{color:var(--txt)!important;font-weight:600}
 .chip i{width:8px;height:8px;border-radius:50%;background:var(--c);box-shadow:0 0 8px var(--c)}
 .stApp .clock{font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:.95rem;color:var(--muted)!important}
-.stApp .pagetitle{display:flex;align-items:baseline;gap:14px;margin:4px 0 12px}
-.stApp .pagetitle .brand{font-size:1.3rem}
 .stApp .sub{color:var(--muted)!important;font-size:.9rem}
 .stApp .live{color:var(--bad)!important;animation:blink 1.2s infinite;font-weight:700;font-size:.8rem;letter-spacing:.1em}
 .stApp .paused{color:var(--warn)!important;font-weight:700;font-size:.8rem;letter-spacing:.1em}
@@ -156,15 +149,18 @@ section[data-testid="stSidebar"]{background:var(--side)!important;border-right:1
 
 div[data-testid="stPlotlyChart"],.panel{position:relative;border:1px solid var(--line);border-radius:12px;
  background:var(--panel);box-shadow:var(--shadow);backdrop-filter:blur(8px);padding:4px}
-.panel{padding:12px 16px}
+.panel{padding:12px 16px;margin-bottom:10px}
 .stApp .ptitle{font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:.95rem;letter-spacing:.06em;margin-bottom:6px}
 .stApp .cap{color:var(--muted)!important;font-size:.85rem}
-.stApp .ov{display:inline-block;margin:6px 8px 0 0;padding:6px 12px;border:1px solid var(--line);border-radius:8px;
- background:var(--panel2);font-size:.8rem;color:var(--muted)!important}
-.stApp .ov b{color:var(--c)!important;font-size:1rem;margin-left:6px}
-
 .stApp .sec{font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:.9rem;letter-spacing:.2em;color:var(--brand)!important;
  margin:22px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}
+.stApp .cp{margin-bottom:12px}
+.stApp .cph{display:flex;justify-content:space-between;font-size:.92rem;font-weight:600}
+.stApp .cph b{color:var(--c)!important;font-variant-numeric:tabular-nums}
+.cpbar{height:6px;border-radius:6px;background:var(--line);margin:5px 0 3px;overflow:hidden}
+.cpbar i{display:block;height:100%;border-radius:6px;background:var(--c);transition:width .5s}
+.stApp .dx{font-size:.9rem;line-height:1.55}
+.stApp .dx ul{margin:6px 0 8px 18px;padding:0}
 .stApp .alert{display:flex;align-items:center;gap:12px;padding:9px 14px;margin-bottom:6px;border:1px solid var(--line);
  border-left:3px solid var(--c);border-radius:8px;background:var(--panel2);font-size:.88rem}
 .stApp .alert .a-t{color:var(--muted)!important;min-width:70px;font-variant-numeric:tabular-nums}
@@ -232,17 +228,14 @@ def make_demo(scenario):
             if i < 40:
                 mode, amp, freq = "NORMALE", 0.02, 25 + rng.normal(0, 1.0)
             else:
-                mode, amp, freq = "INSTABLE", 0.02 + 0.08 * rng.uniform(), 32 + rng.normal(0, 6)
+                mode, amp, freq = "INSTABLE", 0.02 + 0.08 * rng.uniform(), 50 + rng.normal(0, 3)
         elif scenario == "Panne":
             if i < 50:
                 mode, amp, freq = "NORMALE", 0.02, 25 + rng.normal(0, 1.0)
             else:
                 mode, amp, freq = "PANNE", 0.38 * rng.normal(1, 0.1), 78 + rng.normal(0, 2)
         else:  # Dérive progressive
-            if i < 40:
-                mode, p = "NORMALE", 0.0
-            else:
-                mode, p = "DERIVE", (i - 40) / 150
+            mode, p = ("NORMALE", 0.0) if i < 40 else ("DERIVE", (i - 40) / 150)
             amp, freq = 0.02 + 0.33 * p * p, 25 + 53 * p + rng.normal(0, 1.2)
         std = 0.645 * amp * rng.normal(1, 0.08)
         ratio = std / 0.0128
@@ -256,8 +249,7 @@ def fetch_api(url):
     try:
         resp = requests.get(f"{url}/measures", params={"limit": 5000}, timeout=3)
         resp.raise_for_status()
-        df = pd.DataFrame(resp.json()).rename(columns={"ts_ms": "ms", "level": "niveau"})
-        df = clean(df)
+        df = clean(pd.DataFrame(resp.json()).rename(columns={"ts_ms": "ms", "level": "niveau"}))
         return df if not df.empty else None
     except Exception:
         return None
@@ -274,6 +266,15 @@ def analyse(raw, contam):
     d["score"] = model.decision_function(d[feats])
     d["ml_anomalie"] = model.predict(d[feats]) == -1
     d["seuil_anomalie"] = d["niveau"] != "NORMAL"
+    # Attribution par ablation : score avec la caractéristique ramenée à la médiane normale moins score réel.
+    # Positif = la caractéristique pousse la mesure vers l'anomalie (approximation, pas une explication exacte).
+    med = train[feats].median()
+    for f in feats:
+        ab = d[feats].copy()
+        ab[f] = med[f]
+        d["attr_" + f] = model.decision_function(ab) - d["score"]
+    ts = np.sort(model.decision_function(train[feats]))
+    d["rarity"] = 100 * (1 - np.searchsorted(ts, d["score"]) / len(ts))   # % du régime normal moins atypique
     h_ratio = (1 - (d["ratio"] - 1) / (RATIO_ZERO - 1)).clip(0, 1) * 100
     h_ml = ((d["score"] + 0.15) / 0.30).clip(0, 1) * 100
     d["health"] = (0.7 * h_ratio + 0.3 * h_ml).ewm(span=8).mean()
@@ -281,31 +282,8 @@ def analyse(raw, contam):
     return d, has_freq, base, feats, len(train)
 
 
-def estimate_rul(d, thr, win):
-    """Régression linéaire de la santé ; intervalle approximatif à 95 % sur la pente."""
-    t_last = float(d["t_s"].max())
-    r = d[d["t_s"] >= t_last - win]
-    if len(r) < 8:
-        return None
-    try:
-        (slope, icpt), cov = np.polyfit(r["t_s"], r["health"], 1, cov=True)
-        se = float(np.sqrt(max(cov[0, 0], 0.0)))
-    except Exception:
-        slope, icpt = np.polyfit(r["t_s"], r["health"], 1)
-        se = 0.0
-    now = float(slope * t_last + icpt)
-
-    def rul_for(s):
-        if now <= thr:
-            return 0.0
-        return np.inf if s > -0.05 else (now - thr) / (-s)
-
-    return {"rul": rul_for(slope), "lo": rul_for(slope - 1.96 * se), "hi": rul_for(slope + 1.96 * se),
-            "slope": float(slope), "now": now, "t_last": t_last}
-
-
 def first_sustained(mask, t, k=3):
-    """Première détection valide : k mesures consécutives signalées (évite les fausses alertes isolées)."""
+    """Première détection valide : k mesures consécutives signalées."""
     arr = (mask.astype(int).rolling(k).sum() == k).to_numpy()
     if not arr.any():
         return np.nan
@@ -313,7 +291,7 @@ def first_sustained(mask, t, k=3):
 
 
 def build_events(v, acked):
-    """Alertes issues des vrais changements d'état : une seule entrée par transition, jamais par rafraîchissement."""
+    """Alertes issues des vrais changements d'état : une seule entrée par transition."""
     ch = v[v["niveau"] != v["niveau"].shift()].reset_index(drop=True)
     rows, prev = [], "NORMAL"
     for i, r in ch.iterrows():
@@ -333,8 +311,7 @@ def build_events(v, acked):
         else:
             status = "Info"
             desc = "Retour à la normale" if lvl == "NORMAL" else f"Amélioration {prev} → {lvl}"
-        rows.append({"id": int(r["ms"]), "temps (s)": round(float(r["t_s"]), 1), "Sévérité": lvl,
-                     "Événement": desc,
+        rows.append({"id": int(r["ms"]), "temps (s)": round(float(r["t_s"]), 1), "Sévérité": lvl, "Événement": desc,
                      "Mesure": f"std {r['std_g']:.3f} g | ratio x{r['ratio']:.1f} | {r['freq_hz']:.0f} Hz",
                      "Statut": status})
         prev = lvl
@@ -342,8 +319,9 @@ def build_events(v, acked):
     return pd.DataFrame(rows, columns=cols).iloc[::-1].reset_index(drop=True)
 
 
+# ----------------------------------------------------------------------------
 # Composants visuels
-
+# ----------------------------------------------------------------------------
 def rgba(h, a):
     h = h.lstrip("#")
     return f"rgba({int(h[0:2], 16)},{int(h[2:4], 16)},{int(h[4:6], 16)},{a})"
@@ -374,6 +352,10 @@ def chip(label, value, color):
     return f"<span class='chip' style='--c:{color}'><i></i>{label} <b>{value}</b></span>"
 
 
+def badge(text, color):
+    return f"<span class='badge' style='--c:{color}'>{text}</span>"
+
+
 def trend(series, n, good_when_up, unit="", fmt="{:+.1f}"):
     """Tendance uniquement s'il y a assez d'historique."""
     if len(series) < n + 1:
@@ -392,7 +374,7 @@ def kpi(label, value, color, sub="", tip="", extra=""):
 
 
 def kpi_gauge(label, value, color, sub, tip):
-    p = f"M10 60 A50 50 0 0 1 110 60"
+    p = "M10 60 A50 50 0 0 1 110 60"
     svg = (f"<svg viewBox='0 0 120 66' class='arc'><path d='{p}' pathLength='100' class='arc-bg'/>"
            f"<path d='{p}' pathLength='100' class='arc-fg' style='stroke:{color};stroke-dasharray:{value:.1f} 100'/>"
            f"<text x='60' y='54' text-anchor='middle' class='arc-t' style='fill:{color}'>{value:.0f}</text></svg>")
@@ -406,85 +388,6 @@ def wave_svg(ratio):
     y = 30 + amp * np.sin(x / 9) * np.sin(x / 61 + 1) + 0.15 * amp * np.sin(x / 3)
     pts = " ".join(f"{a:.1f},{b:.1f}" for a, b in zip(x, y))
     return f"<svg class='wave' viewBox='0 0 400 60' preserveAspectRatio='none'><polyline points='{pts}'/></svg>"
-
-
-def gauge(value, rng, title, color, steps, suffix=""):
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number", value=value,
-        number={"suffix": suffix, "font": {"family": "Space Grotesk", "size": 42, "color": color}},
-        gauge={"axis": {"range": rng, "tickcolor": T["muted"], "tickfont": {"color": T["muted"]}},
-               "bar": {"color": color, "thickness": 0.3}, "bgcolor": "rgba(0,0,0,0)", "borderwidth": 0,
-               "steps": steps}))
-    return style(fig, 260, title)
-
-
-TWIN_HTML = """
-<div id="w" style="position:relative;width:100%;height:__H__px;border-radius:12px;overflow:hidden;
-background:radial-gradient(ellipse at 50% 45%,__GLOW__ 0%,transparent 70%)">
-<div id="c" style="position:absolute;inset:0"></div>
-<div id="msg" style="position:absolute;left:12px;bottom:8px;color:#8998B8;font:11px Inter,sans-serif">
-Glisser pour orienter le moteur</div></div>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-<script>
-(function(){
-if(typeof THREE==='undefined'){document.getElementById('msg').textContent='Three.js indisponible (hors ligne) : jumeau 3D non affiché';return;}
-const reduce=window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-const el=document.getElementById('c');const W=el.clientWidth||600,H=el.clientHeight||__H__;
-const r=new THREE.WebGLRenderer({antialias:true,alpha:true});r.setSize(W,H);r.setPixelRatio(Math.min(window.devicePixelRatio||1,2));el.appendChild(r.domElement);
-const s=new THREE.Scene();const cam=new THREE.PerspectiveCamera(38,W/H,.1,100);cam.position.set(0,2.4,8.6);cam.lookAt(0,0,0);
-const col=new THREE.Color('__C__');
-s.add(new THREE.AmbientLight(0x8899bb,.6));
-const key=new THREE.DirectionalLight(0xffffff,1.2);key.position.set(4,6,5);s.add(key);
-const rim=new THREE.PointLight(col,2.4,30);rim.position.set(-5,2,-3);s.add(rim);
-const rim2=new THREE.PointLight(col,1.3,30);rim2.position.set(5,-1,4);s.add(rim2);
-const g=new THREE.Group();s.add(g);
-const steel=new THREE.MeshStandardMaterial({color:0x4a5878,metalness:.85,roughness:.32});
-const dark=new THREE.MeshStandardMaterial({color:0x1b2338,metalness:.7,roughness:.45});
-const chrome=new THREE.MeshStandardMaterial({color:0xcfd8ee,metalness:1,roughness:.18});
-const glow=new THREE.MeshStandardMaterial({color:col,emissive:col,emissiveIntensity:.9,metalness:.3,roughness:.4});
-function cyl(rt,rb,h,m){return new THREE.Mesh(new THREE.CylinderGeometry(rt,rb,h,48),m);}
-function box(w,h,d,m,x,y,z){const b=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),m);b.position.set(x,y,z);g.add(b);return b;}
-const body=cyl(1.2,1.2,3.4,steel);body.rotation.z=Math.PI/2;g.add(body);
-for(let i=0;i<13;i++){const f=new THREE.Mesh(new THREE.TorusGeometry(1.22,.045,10,64),dark);f.rotation.y=Math.PI/2;f.position.x=-1.5+i*.25;g.add(f);}
-const front=cyl(1.28,1.28,.3,dark);front.rotation.z=Math.PI/2;front.position.x=1.85;g.add(front);
-const rear=cyl(1.15,1.15,.7,dark);rear.rotation.z=Math.PI/2;rear.position.x=-2.0;g.add(rear);
-const ring=new THREE.Mesh(new THREE.TorusGeometry(1.0,.03,8,64),glow);ring.rotation.y=Math.PI/2;ring.position.x=-2.37;g.add(ring);
-box(1.1,.5,.9,dark,-.2,1.45,0);box(.7,.08,.5,glow,-.2,1.72,0);
-box(2.8,.25,.5,steel,0,-1.28,-.8);box(2.8,.25,.5,steel,0,-1.28,.8);box(4.8,.15,2.6,dark,0,-1.5,0);
-const rotor=new THREE.Group();rotor.position.x=2.0;g.add(rotor);
-const shaft=cyl(.2,.2,1.6,chrome);shaft.rotation.z=Math.PI/2;shaft.position.x=.8;rotor.add(shaft);
-const disk=cyl(.55,.55,.12,chrome);disk.rotation.z=Math.PI/2;disk.position.x=1.1;rotor.add(disk);
-for(let k=0;k<6;k++){const a=k*Math.PI/3;const m=new THREE.Mesh(new THREE.BoxGeometry(.14,.14,.14),glow);m.position.set(1.1,Math.cos(a)*.45,Math.sin(a)*.45);rotor.add(m);}
-let drag=false,px=0,py=0,ry=-.55,rx=.15;
-r.domElement.addEventListener('pointerdown',e=>{drag=true;px=e.clientX;py=e.clientY;});
-window.addEventListener('pointerup',()=>{drag=false;});
-window.addEventListener('pointermove',e=>{if(!drag)return;ry+=(e.clientX-px)*.008;rx+=(e.clientY-py)*.005;rx=Math.max(-.6,Math.min(.8,rx));px=e.clientX;py=e.clientY;});
-const speed=__SPEED__*(reduce?.2:1),amp=reduce?0:__AMP__;let t=0;
-(function loop(){t+=1;rotor.rotation.x+=speed;g.rotation.y=ry+(drag?0:Math.sin(t*.004)*.12);g.rotation.x=rx;
-g.position.y=Math.sin(t*1.9)*amp;g.position.z=Math.cos(t*2.3)*amp*.6;r.render(s,cam);requestAnimationFrame(loop);})();
-})();
-</script>
-"""
-
-
-def twin(freq, ratio, color, height=360):
-    """Moteur 3D procédural. La vitesse suit la fréquence dominante (proxy), la secousse suit le ratio de vibration.
-    Les valeurs sont arrondies pour ne pas recharger l'iframe à chaque rafraîchissement."""
-    f = round(min(max(freq, 10), 100) / 5) * 5
-    rr = round(min(ratio, 10) * 2) / 2
-    speed = 0.04 + f / 100 * 0.35
-    amp = 0.004 + rr * 0.006
-    glow = rgba(color, 0.16)
-    code = (TWIN_HTML.replace("__H__", str(height)).replace("__C__", color).replace("__GLOW__", glow)
-            .replace("__SPEED__", f"{speed:.3f}").replace("__AMP__", f"{amp:.3f}"))
-    if hasattr(st, "iframe"):  # Streamlit récent : components.html est déprécié
-        st.iframe(code, height=height + 4)
-    else:
-        components.html(code, height=height + 4)
-
-
-def badge(text, color):
-    return f"<span class='badge' style='--c:{color}'>{text}</span>"
 
 
 STATUS_COL = {"Active": "bad", "Acquittée": "tele", "Résolue": "good", "Escaladée": "warn", "Info": "muted"}
@@ -512,13 +415,52 @@ def style_levels(df, level_col, status_col=None):
         return f"color:{T[c]};font-weight:700" if c else ""
 
     sty = df.style.map(lv, subset=[level_col])
-    if status_col:
-        sty = sty.map(stt, subset=[status_col])
-    return sty
+    return sty.map(stt, subset=[status_col]) if status_col else sty
 
+
+def comp_color(s):
+    return T["good"] if s < 0.15 else T["warn"] if s < 0.45 else T["bad"]
+
+
+def comp_cards(dg):
+    out = []
+    for k, (name, fault, _) in COMPONENTS.items():
+        s = dg["susp"][k]
+        out.append(f"<div class='cp' style='--c:{comp_color(s)}'><div class='cph'><span>{name}</span>"
+                   f"<b>{s * 100:.0f} %</b></div><div class='cpbar'><i style='width:{s * 100:.0f}%'></i></div>"
+                   f"<div class='cap'>{fault}</div></div>")
+    return "".join(out)
+
+
+def diagnosis_card(dg):
+    ev = "".join(f"<li>{e}</li>" for e in dg["evidence"])
+    act = f"<b>Suggested check:</b> {dg['action']}" if dg["action"] else ""
+    col = comp_color(max(dg["susp"].values()))
+    return (f"<div class='panel dx' style='--c:{col}'><div class='ptitle'>Diagnosis</div>"
+            f"<b style='color:{col}'>{dg['label']}</b><ul>{ev}</ul>{act}"
+            "<div class='cap' style='margin-top:6px'>Heuristic from vibration-order analysis on simulated or "
+            "measured features. It points to a hypothesis, not a confirmed fault location.</div></div>")
+
+
+def twin(c, height=560):
+    """Jumeau 3D (composant Three.js) : reçoit la télémétrie à chaque rafraîchissement sans recharger l'iframe."""
+    if _twin is None:
+        st.warning("Dossier twin_component/ introuvable : place-le à côté de dashboard.py.")
+        return
+    last, dg = c["last"], c["diag"]
+    comps = {}
+    for k, (name, fault, _) in COMPONENTS.items():
+        s = dg["susp"][k]
+        why = (f"Probability {dg['probs'][k] * 100:.0f} %. " + dg["evidence"][0]) if s >= 0.15 else "No abnormal signature."
+        comps[k] = dict(s=round(s, 3), name=name, fault=fault, why=why)
+    state = dict(level=c["lvl"], level_en=LEVEL_EN[c["lvl"]], ratio=float(last["ratio"]), std=float(last["std_g"]),
+                 freq=float(last["freq_hz"]), order=None if not np.isfinite(dg["order"]) else float(dg["order"]),
+                 f0=None if not np.isfinite(c["f0"]) else float(c["f0"]), health=c["health"],
+                 score=float(last["score"]), simulated=src == SRC_DEMO, comps=comps, height=height,
+                 colors={k: T[k] for k in ("good", "warn", "bad", "tele", "brand")})
+    _twin(state=state, key="twin", default=None)
 
 # Barre latérale : données, lecture, analyse
-
 st.sidebar.markdown("**Source des données**")
 src = st.sidebar.radio("Source", [SRC_DEMO, SRC_CSV, SRC_API], label_visibility="collapsed")
 is_api = src == SRC_API
@@ -566,7 +508,6 @@ if raw.empty:
     st.markdown("<div class='topbar'><div><div class='brand'>SENTINELEDGE</div>"
                 "<div class='sub'>Aucune donnée à afficher</div></div></div>", unsafe_allow_html=True)
     st.info("Charge un fichier CSV issu de Wokwi, démarre l'API, ou choisis la source Démonstration.")
-    st.markdown("<div class='tagline'>Anticipate failure. Preserve performance.</div>", unsafe_allow_html=True)
     st.stop()
 
 if not is_api:
@@ -576,28 +517,23 @@ if not is_api:
     d0 = analyse(raw, contam)[0]
     st.sidebar.download_button("Télécharger l'analyse (CSV)", d0.to_csv(index=False).encode("utf-8"),
                                "sentinel_analyse.csv", "text/csv", width="stretch")
-
 st.sidebar.markdown("<div class='tagline'>Anticipate failure.<br>Preserve performance.</div>", unsafe_allow_html=True)
 
 
+# ----------------------------------------------------------------------------
 # Pages
-
+# ----------------------------------------------------------------------------
 def header(ctx):
-    src_col = T["brand"] if src == SRC_DEMO else T["tele"]
-    chips = [chip("Source", f"{src}{' (simulée)' if src == SRC_DEMO else ''}", src_col)]
+    chips = [chip("Source", f"{src}{' (simulée)' if src == SRC_DEMO else ''}", T["brand"] if src == SRC_DEMO else T["tele"])]
     if is_api:
         if not ctx["api_ok"]:
-            chips.append(chip("API", "injoignable", T["bad"]))
-            chips.append(chip("Réseau", "déconnecté", T["bad"]))
+            chips += [chip("API", "injoignable", T["bad"]), chip("Réseau", "déconnecté", T["bad"])]
         elif ctx["stale"]:
-            chips.append(chip("API", "joignable", T["good"]))
-            chips.append(chip("Données", f"obsolètes (> {STALE_S:.0f} s)", T["warn"]))
+            chips += [chip("API", "joignable", T["good"]), chip("Données", f"obsolètes (> {STALE_S:.0f} s)", T["warn"])]
         else:
-            chips.append(chip("API", "joignable", T["good"]))
-            chips.append(chip("Données", "à jour", T["good"]))
+            chips += [chip("API", "joignable", T["good"]), chip("Données", "à jour", T["good"])]
     else:
-        chips.append(chip("API", "non utilisée", T["muted"]))
-        chips.append(chip("Réseau", "hors ligne (rejeu local)", T["muted"]))
+        chips += [chip("API", "non utilisée", T["muted"]), chip("Réseau", "hors ligne (rejeu local)", T["muted"])]
     chips.append(chip("Thème", theme, T["brand"]))
     if ctx["finished"]:
         tag = "<span class='paused'>TERMINÉ</span>"
@@ -606,7 +542,7 @@ def header(ctx):
     elif is_api:
         tag = "<span class='paused'>HORS LIGNE</span>"
     elif playing:
-        tag = "<span class='simtag'>SIMULATION</span>" if src == SRC_DEMO else "<span class='simtag'>REJEU</span>"
+        tag = f"<span class='simtag'>{'SIMULATION' if src == SRC_DEMO else 'REJEU'}</span>"
     else:
         tag = "<span class='paused'>PAUSE</span>"
     st.markdown(
@@ -617,20 +553,54 @@ def header(ctx):
         unsafe_allow_html=True)
 
 
-def page_overview(c):
-    v, d, last = c["v"], c["d"], c["last"]
-    health, res, lvl = c["health"], c["res"], c["lvl"]
-    t_now, t_end = c["t_now"], c["t_end"]
-    ev = c["ev"]
-    n_active = int((ev["Statut"] == "Active").sum())
+def health_chart(c, rng_label):
+    v, res, t_now, t_end = c["v"], c["res"], c["t_now"], c["t_end"]
+    rng = RANGES[rng_label]
+    vv = v if rng is None else v[v["t_s"] >= t_now - rng]
+    fig = go.Figure()
+    for y0, y1, key in [(0, 40, "bad"), (40, 70, "warn"), (70, 100, "good")]:
+        fig.add_hrect(y0=y0, y1=y1, fillcolor=rgba(T[key], .06), line_width=0)
+    fig.add_trace(go.Scatter(x=vv["t_s"], y=vv["health"], mode="lines", name="Santé (mesurée)",
+                             line=dict(color=T["tele"], width=3, shape="spline", smoothing=0.6),
+                             fill="tozeroy", fillcolor=rgba(T["tele"], .10)))
+    chg = vv[vv["niveau"] != vv["niveau"].shift()]
+    fig.add_trace(go.Scatter(x=chg["t_s"], y=chg["health"], mode="markers", name="Changement d'état",
+                             marker=dict(size=11, color=[LV.get(x, T["tele"]) for x in chg["niveau"]],
+                                         line=dict(color=T["txt"], width=1)),
+                             text=chg["niveau"], hovertemplate="%{text}<br>t=%{x:.1f} s<extra></extra>"))
+    cu = c["cus"]
+    if cu:
+        fig.add_vline(x=cu["onset"], line_dash="dot", line_color=T["brand"], annotation_text="début de dérive (CUSUM)",
+                      annotation_font_color=T["brand"])
+    fig.add_hline(y=threshold, line_dash="dot", line_color=T["bad"], annotation_text="seuil de panne",
+                  annotation_font_color=T["bad"])
+    xmax = t_end
+    if res and np.isfinite(res["rul"]) and res["rul"] > 0:
+        hi_c = res["hi"] if np.isfinite(res["hi"]) else res["rul"] * 2.2
+        fig.add_trace(go.Scatter(
+            x=[res["t_last"], res["t_last"] + res["lo"], res["t_last"] + hi_c, res["t_last"]],
+            y=[res["now"], threshold, threshold, res["now"]], fill="toself", mode="none",
+            fillcolor=rgba(T["bad"], .14), name="Incertitude P10-P90 (bootstrap)", hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=res["path_t"], y=res["path_y"], mode="lines",
+                                 name=f"Projection ({res['model']}, estimation)",
+                                 line=dict(dash="dash", color=T["bad"], width=2)))
+        xmax = max(t_end, res["t_last"] + hi_c)
+    fig.update_xaxes(range=[float(vv["t_s"].min()), xmax * 1.02], title="temps (s)")
+    fig.update_yaxes(range=[0, 105], title="santé")
+    show(style(fig, 400, "Santé de la machine : historique et projection"), "health")
+    if rng and t_now < rng:
+        st.caption(f"Données disponibles : {t_now:.0f} s seulement ; la plage {rng_label} est tronquée.")
 
+
+def page_overview(c):
+    v, last, res, dg = c["v"], c["last"], c["res"], c["diag"]
+    health, lvl, ev = c["health"], c["lvl"], c["ev"]
+    n_active = int((ev["Statut"] == "Active").sum())
     rank = max(RANK[lvl], 0 if health >= 70 else 1 if health >= 40 else 2)
     state, col, cls, msg = [
         ("FONCTIONNEMENT NORMAL", T["good"], "", "Vibrations dans la plage de référence."),
-        ("ATTENTION : COMPORTEMENT ANORMAL", T["warn"], "",
-         "Vibration au-dessus de la référence ; surveiller l'évolution."),
-        ("CRITIQUE : INTERVENTION REQUISE", T["bad"], "crit",
-         "Anomalie sévère détectée ; inspection recommandée.")][rank]
+        ("ATTENTION : COMPORTEMENT ANORMAL", T["warn"], "", "Vibration au-dessus de la référence ; surveiller l'évolution."),
+        ("CRITIQUE : INTERVENTION REQUISE", T["bad"], "crit", "Anomalie sévère détectée ; inspection recommandée.")][rank]
     if res is None:
         rul_txt, rul_sub = "n/d", "pas assez de mesures"
     elif res["rul"] == 0:
@@ -639,95 +609,64 @@ def page_overview(c):
         rul_txt, rul_sub = "Stable", "aucune dégradation estimée"
     else:
         hi = f"{res['hi']:.0f}" if np.isfinite(res["hi"]) else "plus"
-        rul_txt, rul_sub = f"~{res['rul']:.0f} s", f"estimation ; intervalle 95 % : {res['lo']:.0f} à {hi} s"
-
+        rul_txt, rul_sub = f"~{res['rul']:.0f} s", f"P10 à P90 : {res['lo']:.0f} à {hi} s | {res['model']}"
     st.markdown(
         f"<div class='banner {cls}' style='--c:{col}'><div><div class='b1'><span class='dot'></span>{state}</div>"
         f"<div class='b2'>{msg} Santé {health:.0f}/100 | mode {last['mode']} | niveau embarqué {lvl}</div>"
-        f"<div class='b3'>Dernière mesure : ms={int(last['ms'])} (T+{t_now:.1f} s)"
+        f"<div class='b2'>Diagnostic : <b>{dg['label']}</b></div>"
+        f"<div class='b3'>Dernière mesure : ms={int(last['ms'])} (T+{c['t_now']:.1f} s)"
         f"{' | données simulées' if src == SRC_DEMO else ''}</div></div>{wave_svg(float(last['ratio']))}</div>",
         unsafe_allow_html=True)
 
     lc = LV.get(lvl, T["tele"])
     k = st.columns(5)
     k[0].markdown(kpi_gauge("Machine Health", health, col, "0 = panne, 100 = neuf",
-                            "Ratio de vibration (70 %) + score Isolation Forest (30 %), lissé."),
-                  unsafe_allow_html=True)
+                            "Ratio de vibration (70 %) + score Isolation Forest (30 %), lissé."), unsafe_allow_html=True)
     k[1].markdown(kpi("Remaining Useful Life", rul_txt, col, rul_sub,
-                      "Projection linéaire de la santé jusqu'au seuil de panne : estimation, pas une garantie."),
+                      "Extrapolation de la santé (linéaire ou quadratique, choix par BIC) : estimation, pas une garantie."),
                   unsafe_allow_html=True)
     k[2].markdown(kpi("Vibration", f"{last['std_g']:.3f} g", lc, trend(v["std_g"], 10, False, " g", "{:+.3f}"),
                       "Écart-type de l'accélération sur la dernière fenêtre."), unsafe_allow_html=True)
     k[3].markdown(kpi("Dominant Frequency", f"{last['freq_hz']:.1f} Hz" if c["has_freq"] else "n/d", T["tele"],
-                      trend(v["freq_hz"], 10, True, " Hz") if c["has_freq"] else "absente (ancien format CSV)",
-                      "Fréquence principale trouvée par la DFT."), unsafe_allow_html=True)
-    k[4].markdown(kpi("Active Alerts", f"{n_active}", T["bad"] if n_active else T["good"],
-                      "non acquittées et non résolues", "Alertes issues des changements d'état."),
+                      (f"ordre {dg['order']:.1f}x | " if np.isfinite(dg["order"]) else "") +
+                      (trend(v["freq_hz"], 10, True, " Hz") if c["has_freq"] else "absente (ancien format CSV)"),
+                      "Fréquence principale (DFT) et ordre par rapport à la rotation de référence."),
                   unsafe_allow_html=True)
+    k[4].markdown(kpi("Active Alerts", f"{n_active}", T["bad"] if n_active else T["good"],
+                      "non acquittées et non résolues", "Alertes issues des changements d'état."), unsafe_allow_html=True)
 
-    section("JUMEAU NUMÉRIQUE ET SANTÉ PRÉDICTIVE")
-    left, right = st.columns([1, 1.7])
+    section("JUMEAU NUMÉRIQUE ET COMPOSANTS")
+    left, right = st.columns([1.6, 1])
     with left:
-        st.markdown("<div class='ptitle'>Digital Twin</div>", unsafe_allow_html=True)
-        twin(float(last["freq_hz"]) if c["has_freq"] else 25.0, float(last["ratio"]), lc)
-        st.markdown(
-            f"<span class='ov' style='--c:{lc}'>Vibration<b>{last['std_g']:.3f} g</b></span>"
-            f"<span class='ov' style='--c:{T['tele']}'>Fréquence<b>{last['freq_hz']:.1f} Hz</b></span>"
-            f"<span class='ov' style='--c:{T['muted']}'>Vitesse<b>n/d</b></span>"
-            "<div class='cap'>Rotation animée proportionnelle à la fréquence dominante. Aucun tachymètre RPM "
-            "n'est mesuré.</div>", unsafe_allow_html=True)
+        twin(c)
+        st.caption("Modèle 3D procédural synchronisé avec la télémétrie : secousse selon le ratio de vibration, forme du "
+                   "mouvement selon le défaut suspecté, surbrillance des composants suspects. La vitesse affichée est "
+                   "supposée (1x = fréquence de référence) : aucun capteur de vitesse n'est mesuré.")
     with right:
-        rng_label = st.radio("Plage", list(RANGES), horizontal=True, label_visibility="collapsed", key="range")
-        rng = RANGES[rng_label]
-        vv = v if rng is None else v[v["t_s"] >= t_now - rng]
-        fig = go.Figure()
-        for y0, y1, key in [(0, 40, "bad"), (40, 70, "warn"), (70, 100, "good")]:
-            fig.add_hrect(y0=y0, y1=y1, fillcolor=rgba(T[key], .06), line_width=0)
-        fig.add_trace(go.Scatter(x=vv["t_s"], y=vv["health"], mode="lines", name="Santé (mesurée)",
-                                 line=dict(color=T["tele"], width=3, shape="spline", smoothing=0.6),
-                                 fill="tozeroy", fillcolor=rgba(T["tele"], .10)))
-        chg = vv[vv["niveau"] != vv["niveau"].shift()]
-        fig.add_trace(go.Scatter(x=chg["t_s"], y=chg["health"], mode="markers", name="Changement d'état",
-                                 marker=dict(size=11, color=[LV.get(x, T["tele"]) for x in chg["niveau"]],
-                                             line=dict(color=T["txt"], width=1)),
-                                 text=chg["niveau"], hovertemplate="%{text}<br>t=%{x:.1f} s<extra></extra>"))
-        t_ml = first_sustained(vv["ml_anomalie"], vv["t_s"])
-        if pd.notna(t_ml):
-            fig.add_vline(x=t_ml, line_dash="dot", line_color=T["brand"], annotation_text="1re anomalie IA",
-                          annotation_font_color=T["brand"])
-        fig.add_hline(y=threshold, line_dash="dot", line_color=T["bad"], annotation_text="seuil de panne",
-                      annotation_font_color=T["bad"])
-        x0, xmax = float(vv["t_s"].min()), t_end
-        if res and np.isfinite(res["rul"]) and res["rul"] > 0:
-            hi_c = res["hi"] if np.isfinite(res["hi"]) else res["rul"] * 2.2
-            fig.add_trace(go.Scatter(
-                x=[res["t_last"], res["t_last"] + res["lo"], res["t_last"] + hi_c, res["t_last"]],
-                y=[res["now"], threshold, threshold, res["now"]], fill="toself", mode="none",
-                fillcolor=rgba(T["bad"], .14), name="Incertitude 95 % (estimée)", hoverinfo="skip"))
-            fig.add_trace(go.Scatter(x=[res["t_last"], res["t_last"] + res["rul"]], y=[res["now"], threshold],
-                                     mode="lines", name="Projection (estimation)",
-                                     line=dict(dash="dash", color=T["bad"], width=2)))
-            xmax = max(t_end, res["t_last"] + hi_c)
-        fig.update_xaxes(range=[x0, xmax * 1.02], title="temps (s)")
-        fig.update_yaxes(range=[0, 105], title="santé")
-        show(style(fig, 450, "Santé de la machine : historique et projection"), "health")
-        if rng and t_now < rng:
-            st.caption(f"Données disponibles : {t_now:.0f} s seulement ; la plage {rng_label} est tronquée.")
+        st.markdown(f"<div class='panel'><div class='ptitle'>Component suspicion</div>{comp_cards(dg)}"
+                    "<div class='cap'>Suspicion = probabilité de la signature x sévérité de la vibration.</div></div>",
+                    unsafe_allow_html=True)
+        st.markdown(diagnosis_card(dg), unsafe_allow_html=True)
 
-    section("CONTRÔLE MACHINE (SIMULATION)")
-    st.caption("Contrôles de démonstration : ils changent le scénario simulé de la source Démonstration. "
-               "Ils ne commandent aucun ESP32 ni aucune machine réelle.")
-    cols = st.columns(4)
-    for col_, name in zip(cols, SIM_MODES):
-        if col_.button(name, key=f"sim_{name}", width="stretch", disabled=src != SRC_DEMO,
-                       type="primary" if (ss.sim == name and src == SRC_DEMO) else "secondary"):
-            ss.sim = name
-            st.rerun()
-    if src != SRC_DEMO:
-        st.caption("Désactivé : sélectionne la source Démonstration pour changer de scénario.")
+    section("SANTÉ PRÉDICTIVE")
+    rng_label = st.radio("Plage", list(RANGES), horizontal=True, label_visibility="collapsed", key="range")
+    health_chart(c, rng_label)
 
-    section("ALERTES RÉCENTES")
-    st.markdown(alerts_html(ev, 5), unsafe_allow_html=True)
+    a, b = st.columns([1.4, 1])
+    with a:
+        section("ALERTES RÉCENTES")
+        st.markdown(alerts_html(ev, 5), unsafe_allow_html=True)
+    with b:
+        section("CONTRÔLE MACHINE (SIMULATION)")
+        st.caption("Contrôles de démonstration : ils changent le scénario simulé. Ils ne commandent aucun ESP32.")
+        cols = st.columns(2)
+        for i, name in enumerate(SIM_MODES):
+            if cols[i % 2].button(name, key=f"sim_{name}", width="stretch", disabled=src != SRC_DEMO,
+                                  type="primary" if (ss.sim == name and src == SRC_DEMO) else "secondary"):
+                ss.sim = name
+                st.rerun()
+        if src != SRC_DEMO:
+            st.caption("Désactivé : choisis la source Démonstration.")
 
 
 def page_telemetry(c):
@@ -752,50 +691,93 @@ def page_telemetry(c):
     modes = sorted(v["mode"].unique())
     sel_modes = f2.multiselect("Mode machine", modes, default=modes)
     nrows = f3.number_input("Lignes max", 10, 2000, 200, 10)
-    tab = v[v["niveau"].isin(levels) & v["mode"].isin(sel_modes)].iloc[::-1]  # plus récentes d'abord
+    tab = v[v["niveau"].isin(levels) & v["mode"].isin(sel_modes)].iloc[::-1]
     if tab.empty:
         st.info("Aucune mesure ne correspond aux filtres (ou aucune donnée reçue).")
         return
     if c["stale"]:
         st.warning(f"Données obsolètes : aucune nouvelle mesure depuis plus de {STALE_S:.0f} s.")
     cols_show = ["ms", "mode", "std_g", "p2p_g", "ratio", "freq_hz", "niveau"]
-    out = tab[cols_show].head(int(nrows))
     fmt = {"std_g": "{:.4f}", "p2p_g": "{:.4f}", "ratio": "{:.2f}", "freq_hz": "{:.1f}"}
-    st.dataframe(style_levels(out, "niveau").format(fmt), width="stretch", height=380, hide_index=True)
+    st.dataframe(style_levels(tab[cols_show].head(int(nrows)), "niveau").format(fmt), width="stretch", height=380,
+                 hide_index=True)
     st.caption("Clique sur un en-tête de colonne pour trier. Les plus récentes sont affichées en premier.")
     st.download_button("Exporter la sélection (CSV)", tab[cols_show].to_csv(index=False).encode("utf-8"),
                        "sentinel_telemetrie.csv", "text/csv", key="dl_tel")
 
 
+def order_fig(c):
+    v, f0 = c["v"], c["f0"]
+    fig = go.Figure()
+    for lo, hi, name, key in [(0.65, 1.35, "1x : imbalance", "good"), (1.55, 2.45, "2x : misalignment", "warn"),
+                              (2.5, 4.2, "high orders : bearings / looseness", "bad")]:
+        fig.add_hrect(y0=lo, y1=hi, fillcolor=rgba(T[key], .09), line_width=0, annotation_text=name,
+                      annotation_position="top left", annotation_font=dict(size=11, color=T[key]))
+    fig.add_trace(go.Scatter(x=v["t_s"], y=v["freq_hz"] / f0, mode="markers", name="Dominant order",
+                             marker=dict(size=7, color=[LV.get(x, T["tele"]) for x in v["niveau"]]),
+                             hovertemplate="t=%{x:.1f} s<br>order %{y:.2f}x<extra></extra>"))
+    if c["cus"]:
+        fig.add_vline(x=c["cus"]["onset"], line_dash="dot", line_color=T["brand"], annotation_text="onset (CUSUM)",
+                      annotation_font_color=T["brand"])
+    fig.update_xaxes(range=[0, c["t_end"] * 1.02], title="temps (s)")
+    fig.update_yaxes(range=[0, 4.4], title="order (x reference frequency)")
+    show(style(fig, 380, "Order tracking: where the energy sits"), "order")
+
+
 def page_ai(c):
-    v, d = c["v"], c["d"]
-    last, has_freq = c["last"], c["has_freq"]
-    section("SPECTROGRAMME ET ESPACE DES CARACTÉRISTIQUES")
+    v, d, last, dg = c["v"], c["d"], c["last"], c["diag"]
+    has_freq, feats = c["has_freq"], c["feats"]
+    section("DIAGNOSTIC DES COMPOSANTS")
+    a, b, m = st.columns([1.2, 1.2, 1])
+    with a:
+        keys = list(COMPONENTS)
+        fig = go.Figure(go.Bar(x=[dg["probs"][k] * 100 for k in keys], y=[COMPONENTS[k][1] for k in keys],
+                               orientation="h", marker_color=[comp_color(dg["susp"][k]) for k in keys],
+                               text=[f"{dg['probs'][k] * 100:.0f} %" for k in keys], textposition="outside"))
+        fig.update_xaxes(range=[0, 115], title="signature match (%)")
+        show(style(fig, 300, "Fault hypotheses (heuristic)"), "faults")
+    with b:
+        vals = [float(last["attr_" + f]) for f in feats]
+        fig = go.Figure(go.Bar(x=vals, y=feats, orientation="h",
+                               marker_color=[T["bad"] if x > 0 else T["good"] for x in vals]))
+        fig.update_xaxes(title="effect on anomaly score (ablation)")
+        show(style(fig, 300, "What drives the anomaly score"), "attr")
+    with m:
+        st.markdown(kpi("Atypical vs normal", f"{last['rarity']:.0f} %", T["brand"],
+                        "of the normal reference is less atypical than this point",
+                        "Percentile du score Isolation Forest par rapport aux mesures de référence."),
+                    unsafe_allow_html=True)
+        st.markdown(diagnosis_card(dg), unsafe_allow_html=True)
+
+    section("SIGNATURE FRÉQUENTIELLE")
     a, b = st.columns(2)
     with a:
+        if has_freq and np.isfinite(c["f0"]):
+            order_fig(c)
+        else:
+            st.info("Pas de fréquence exploitable : l'analyse d'ordres nécessite freq_hz.")
+    with b:
         if has_freq:
             fig = px.density_heatmap(v, x="t_s", y="freq_hz", z="std_g", histfunc="avg", nbinsx=60, nbinsy=34,
                                      color_continuous_scale="Viridis")
             fig.update_xaxes(range=[0, c["t_end"] * 1.02], title="temps (s)")
             fig.update_yaxes(range=[0, 100], title="fréquence (Hz)")
             fig.update_coloraxes(colorbar=dict(title="std (g)", thickness=10))
-            show(style(fig, 380, "Spectrogramme (fréquence dominante × amplitude)"), "spectro")
-            st.caption("Construit à partir des caractéristiques calculées sur l'ESP32 (fréquence dominante et écart-type "
-                       "par fenêtre), pas à partir des échantillons bruts d'accélération.")
-        else:
-            st.info("Pas de fréquence dans ce fichier (ancien format). Mets à jour le sketch Wokwi.")
-    with b:
+            show(style(fig, 380, "Spectrogramme (fréquence dominante x amplitude)"), "spectro")
+            st.caption("Construit à partir des caractéristiques calculées par fenêtre, pas des échantillons bruts.")
+
+    section("ESPACE DES CARACTÉRISTIQUES ET MODÈLE")
+    a, b = st.columns([1.2, 1])
+    with a:
         axis3d = dict(backgroundcolor="rgba(0,0,0,0)", gridcolor=T["grid"], color=T["muted"])
         fig = go.Figure()
         if has_freq:
-            for lvl_name in RANK:
-                s = v[v["niveau"] == lvl_name]
+            for name in RANK:
+                s = v[v["niveau"] == name]
                 if s.empty:
                     continue
-                fig.add_trace(go.Scatter3d(
-                    x=s["freq_hz"], y=s["std_g"], z=s["p2p_g"], mode="markers", name=lvl_name,
-                    marker=dict(size=3.5, color=LV[lvl_name], opacity=0.85),
-                    hovertemplate="freq %{x:.1f} Hz<br>std %{y:.4f} g<br>p2p %{z:.4f} g<extra>" + lvl_name + "</extra>"))
+                fig.add_trace(go.Scatter3d(x=s["freq_hz"], y=s["std_g"], z=s["p2p_g"], mode="markers", name=name,
+                                           marker=dict(size=3.5, color=LV[name], opacity=0.85)))
             fig.add_trace(go.Scatter3d(x=[last["freq_hz"]], y=[last["std_g"]], z=[last["p2p_g"]], mode="markers",
                                        marker=dict(size=9, color=T["txt"], line=dict(color=T["brand"], width=3)),
                                        name="Maintenant"))
@@ -804,29 +786,7 @@ def page_ai(c):
         else:
             fig = px.scatter(v, x="std_g", y="p2p_g", color="niveau", color_discrete_map=LV)
         show(style(fig, 380, "Espace des caractéristiques"), "feat3d")
-
-    section("SEUIL EMBARQUÉ ET ISOLATION FOREST")
-    t_thr = first_sustained(v["seuil_anomalie"], v["t_s"])
-    t_ml = first_sustained(v["ml_anomalie"], v["t_s"])
-    m = st.columns(3)
-    m[0].markdown(kpi("Première alerte seuil", f"{t_thr:.1f} s" if pd.notna(t_thr) else "aucune", T["warn"],
-                      "3 mesures consécutives"), unsafe_allow_html=True)
-    m[1].markdown(kpi("Première anomalie IA", f"{t_ml:.1f} s" if pd.notna(t_ml) else "aucune", T["brand"],
-                      "3 mesures consécutives"), unsafe_allow_html=True)
-    if pd.notna(t_thr) and pd.notna(t_ml):
-        gap = t_thr - t_ml
-        txt = f"{abs(gap):.1f} s"
-        sub = ("l'IA détecte avant le seuil" if gap > 0 else
-               "le seuil détecte avant l'IA" if gap < 0 else "détection simultanée")
-    else:
-        txt, sub = "n/d", "comparaison impossible : une méthode n'a pas encore détecté"
-    m[2].markdown(kpi("Avance de détection", txt, T["tele"], sub), unsafe_allow_html=True)
-    st.caption("Seuil embarqué : règle fixe sur le ratio de vibration (attention ≥ 2,5, critique ≥ 6), calculée sur "
-               "l'ESP32. Isolation Forest : score statistique d'écart par rapport au comportement normal appris ; il "
-               "signale qu'une mesure est atypique, pas la cause physique du défaut.")
-
-    a, b, c3 = st.columns([1.4, 1.2, 1])
-    with a:
+    with b:
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=v["t_s"], y=v["score"], mode="lines", name="Score IA",
                                  line=dict(color=T["brand"], width=2)))
@@ -836,21 +796,48 @@ def page_ai(c):
         fig.add_hline(y=0, line_dash="dot", line_color=T["muted"])
         fig.update_xaxes(range=[0, c["t_end"] * 1.02], title="temps (s)")
         fig.update_yaxes(title="score (bas = atypique)")
-        show(style(fig, 340, "Score Isolation Forest"), "score")
-    with b:
-        shares = v["niveau"].value_counts()
-        fig = go.Figure(go.Pie(labels=shares.index, values=shares.values, hole=0.72, sort=False,
-                               marker=dict(colors=[LV.get(x, T["tele"]) for x in shares.index],
-                                           line=dict(color=T["bg"], width=3)), textinfo="percent"))
-        fig.add_annotation(text=f"{len(v)}<br>mesures", showarrow=False, font=dict(size=16, color=T["txt"]))
-        show(style(fig, 340, "Répartition des niveaux"), "pie")
-    with c3:
-        show(gauge(float(last["score"]), [-0.3, 0.3], "Score actuel", T["brand"],
-                   [{"range": [-0.3, 0], "color": rgba(T["bad"], .2)},
-                    {"range": [0, 0.3], "color": rgba(T["good"], .2)}]), "g_score")
+        show(style(fig, 380, "Score Isolation Forest"), "score")
 
-    section("SYNTHÈSE DIAGNOSTIQUE")
-    feats = c["feats"]
+    section("COMPARAISON DES MÉTHODES DE DÉTECTION")
+    t_thr = first_sustained(v["seuil_anomalie"], v["t_s"])
+    t_ml = first_sustained(v["ml_anomalie"], v["t_s"])
+    cu = c["cus"]
+    q = st.columns(4)
+    q[0].markdown(kpi("Seuil embarqué", f"{t_thr:.1f} s" if pd.notna(t_thr) else "aucune", T["warn"],
+                      "3 mesures consécutives"), unsafe_allow_html=True)
+    q[1].markdown(kpi("Isolation Forest", f"{t_ml:.1f} s" if pd.notna(t_ml) else "aucune", T["brand"],
+                      "3 mesures consécutives"), unsafe_allow_html=True)
+    q[2].markdown(kpi("Début de dérive (CUSUM)", f"{cu['onset']:.1f} s" if cu else "aucun", T["tele"],
+                      f"alarme à {cu['alarm']:.1f} s" if cu else "changement non détecté",
+                      "Estimation du moment où la vibration commence à dériver."), unsafe_allow_html=True)
+    if pd.notna(t_thr) and cu:
+        lead = t_thr - cu["onset"]
+        q[3].markdown(kpi("Avance sur le seuil", f"{lead:+.1f} s", T["good"] if lead > 0 else T["muted"],
+                          "début de dérive estimé vs première alerte seuil"), unsafe_allow_html=True)
+    else:
+        q[3].markdown(kpi("Avance sur le seuil", "n/d", T["muted"], "comparaison impossible"), unsafe_allow_html=True)
+    st.caption("Seuil : règle fixe sur le ratio (attention ≥ 2,5, critique ≥ 6). Isolation Forest : score statistique "
+               "d'écart au comportement normal. CUSUM : détection de changement sur la tendance du ratio. Aucune "
+               "méthode n'identifie à elle seule la cause physique.")
+
+    section("PRÉDICTION DE PANNE")
+    res = c["res"]
+    if res is None:
+        st.info("Au moins 10 mesures récentes sont nécessaires pour estimer le temps avant panne.")
+    else:
+        rows = [{"Modèle": k, "RMSE": round(f["rmse"], 3), "BIC": round(f["bic"], 1),
+                 "Retenu": "oui" if k == res["model"] else ""} for k, f in res["fits"].items()]
+        left, right = st.columns([1, 1.4])
+        left.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        hi_txt = ("%.0f s" % res["hi"]) if np.isfinite(res["hi"]) else "sans borne"
+        txt = ("seuil déjà atteint" if res["rul"] == 0 else "pas de dégradation estimée" if np.isinf(res["rul"])
+               else f"~{res['rul']:.0f} s (P10 {res['lo']:.0f} s, P90 {hi_txt})")
+        right.markdown(f"<div class='panel dx'><div class='ptitle'>Estimation</div>Temps avant le seuil de santé "
+                       f"{threshold} : <b>{txt}</b>.<br>Modèle retenu : <b>{res['model']}</b> (critère BIC). "
+                       "L'incertitude vient d'un bootstrap des résidus ; elle ignore l'évolution future du régime "
+                       "de la machine. C'est une aide à la décision, pas une garantie.</div>", unsafe_allow_html=True)
+
+    section("SYNTHÈSE ET MODÈLE")
     ref = d[d["mode"] == "NORMALE"]
     if len(ref) < 10:
         ref = d.head(max(10, len(d) // 5))
@@ -861,22 +848,10 @@ def page_ai(c):
         rows.append({"Caractéristique": f_, "Actuel": round(float(last[f_]), 4), "Référence (moy.)": round(mu, 4),
                      "Écart (σ)": round(z, 1) if np.isfinite(z) else None})
     left, right = st.columns([1.3, 1])
-    with left:
-        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
-    with right:
-        flagged = bool(last["ml_anomalie"])
-        st.markdown(
-            f"<div class='panel'><div class='ptitle'>État du modèle</div>"
-            f"<div class='cap'>Isolation Forest, 200 arbres, contamination {contam:.2f}<br>"
-            f"Entraîné sur {c['n_train']} mesures de référence (mode NORMALE si disponible)<br>"
-            f"Score actuel : {float(last['score']):+.3f}</div></div>", unsafe_allow_html=True)
-        st.write("")
-        worst = max(rows, key=lambda r_: abs(r_["Écart (σ)"] or 0))
-        st.markdown(
-            f"<div class='cap'>{'La dernière mesure est jugée atypique' if flagged else 'La dernière mesure reste dans la zone apprise'}"
-            f" ; l'écart le plus marqué concerne <b>{worst['Caractéristique']}</b> "
-            f"({worst['Écart (σ)'] if worst['Écart (σ)'] is not None else 'n/d'} σ par rapport à la référence). "
-            "Ce résultat est statistique et n'identifie pas la cause physique.</div>", unsafe_allow_html=True)
+    left.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    right.markdown(f"<div class='panel'><div class='ptitle'>État du modèle</div><div class='cap'>Isolation Forest, 200 "
+                   f"arbres, contamination {contam:.2f}<br>Entraîné sur {c['n_train']} mesures de référence<br>"
+                   f"Score actuel : {float(last['score']):+.3f}</div></div>", unsafe_allow_html=True)
 
 
 def page_events(c):
@@ -906,11 +881,9 @@ def page_events(c):
 def page_api(c):
     section("API ET BASE DE DONNÉES")
     if not is_api:
-        st.info("Source actuelle : " + src + ". Choisis « API (SQLite) » dans la barre latérale pour interroger le backend FastAPI.")
-    st.markdown(f"<div class='panel' style='text-align:left'><div class='ptitle'>Backend</div>"
-                f"<div class='cap'>URL : {html.escape(url)} (variable d'environnement SENTINEL_API_URL)<br>"
-                f"Mesures chargées : {c['n']}</div></div>", unsafe_allow_html=True)
-    st.write("")
+        st.info("Source actuelle : " + src + ". Choisis « API (SQLite) » pour interroger le backend FastAPI.")
+    st.markdown(f"<div class='panel'><div class='ptitle'>Backend</div><div class='cap'>URL : {html.escape(url)} "
+                f"(variable SENTINEL_API_URL)<br>Mesures chargées : {c['n']}</div></div>", unsafe_allow_html=True)
     st.dataframe(pd.DataFrame([
         ["POST", "/measure", "Ajoute une mesure"], ["POST", "/measures/batch", "Ajoute un lot de mesures"],
         ["GET", "/measures?limit=2000", "Lit les dernières mesures"], ["GET", "/summary", "Résumé de la base"],
@@ -938,14 +911,13 @@ def page_api(c):
 
 def page_settings(c):
     section("PRÉFÉRENCES")
-    st.markdown(f"<div class='cap'>Thème actif : <b>{theme}</b>. Le thème est conservé dans l'URL de la page "
-                "(ajoute-la à tes favoris pour le retrouver).</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='cap'>Thème actif : <b>{theme}</b>. Il est conservé dans l'URL de la page.</div>",
+                unsafe_allow_html=True)
     st.dataframe(pd.DataFrame([
         ["Source", src], ["Intervalle de rafraîchissement", f"{interval:.1f} s"],
         ["Mesures par rafraîchissement", "n/a (API)" if is_api else step],
         ["Contamination Isolation Forest", contam], ["Seuil de panne (santé)", threshold],
-        ["Fenêtre de tendance", f"{window_s} s"]], columns=["Paramètre", "Valeur"]),
-        width="stretch", hide_index=True)
+        ["Fenêtre de tendance", f"{window_s} s"]], columns=["Paramètre", "Valeur"]), width="stretch", hide_index=True)
     st.caption("Ces paramètres se modifient dans la barre latérale.")
     if st.button("Réinitialiser les préférences"):
         st.query_params.clear()
@@ -956,7 +928,6 @@ def page_settings(c):
 
 
 # Vue principale (se rafraîchit seule)
-
 def live_view():
     r, api_ok, stale = raw, True, False
     if is_api:
@@ -978,17 +949,16 @@ def live_view():
     v = d.iloc[:pos]
     last = v.iloc[-1]
     lvl = last["niveau"]
-    res = estimate_rul(v, threshold, window_s)
+    f0, crest0 = reference(d)
     t_now, t_end = float(last["t_s"]), float(d["t_s"].max())
-    ev = build_events(v, ss.acked)
-
     if ss.last_level is not None and RANK.get(lvl, 0) > RANK.get(ss.last_level, 0):
         st.toast(f"Niveau {lvl} atteint à T+{t_now:.0f} s")
     ss.last_level = lvl
 
     ctx = dict(v=v, d=d, last=last, has_freq=has_freq, base=base, feats=feats, n_train=n_train, n=n, pos=pos,
-               health=float(last["health"]), res=res, lvl=lvl, t_now=t_now, t_end=t_end, ev=ev,
-               api_ok=api_ok, stale=stale, finished=pos >= n and not is_api)
+               health=float(last["health"]), res=rul_estimate(v, threshold, window_s), lvl=lvl, t_now=t_now,
+               t_end=t_end, ev=build_events(v, ss.acked), api_ok=api_ok, stale=stale, finished=pos >= n and not is_api,
+               f0=f0, diag=diagnose(last, f0, crest0), cus=cusum(v))
     header(ctx)
     {"Overview": page_overview, "Live Telemetry": page_telemetry, "AI Diagnostics": page_ai,
      "Event History": page_events, "API & Database": page_api, "Settings": page_settings}[page](ctx)
