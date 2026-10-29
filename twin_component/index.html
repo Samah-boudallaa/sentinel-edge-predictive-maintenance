@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+html,body{margin:0;height:100%;background:transparent;overflow:hidden;font-family:Inter,system-ui,sans-serif;color:#E8EEFF}
+#wrap{position:relative;width:100%;height:100%;overflow:hidden;border-radius:12px}
+canvas{display:block;width:100%;height:100%;cursor:grab;touch-action:none}
+.glass{background:rgba(8,13,27,.74);border:1px solid rgba(137,152,184,.28);border-radius:10px;backdrop-filter:blur(8px)}
+#bar{position:absolute;top:10px;left:10px;display:flex;gap:6px;flex-wrap:wrap;z-index:3;max-width:60%}
+.b{font:600 11px Inter,sans-serif;padding:5px 10px;border:1px solid rgba(137,152,184,.3);border-radius:7px;
+ background:rgba(8,13,27,.74);color:#cfd8ee;cursor:pointer}
+.b:hover{border-color:#8B5CF6}.b.on{border-color:#8B5CF6;color:#fff;background:rgba(139,92,246,.28)}
+#hud{position:absolute;top:10px;right:10px;padding:10px 14px;min-width:190px;font-size:12px;line-height:1.55;z-index:3}
+#hud .k{color:#8998B8}#hud b{font-weight:600;font-variant-numeric:tabular-nums}
+#hud .lv{display:inline-block;padding:1px 9px;border-radius:999px;font-weight:700;font-size:11px;margin-bottom:4px}
+#card{position:absolute;left:10px;bottom:10px;max-width:310px;padding:10px 14px;font-size:12px;line-height:1.5;z-index:3;display:none}
+#lab{position:absolute;left:0;top:0;pointer-events:none;z-index:2;padding:4px 10px;border-radius:8px;font:600 12px Inter,sans-serif;
+ white-space:nowrap;display:none}
+#tip{position:absolute;pointer-events:none;z-index:4;padding:3px 8px;border-radius:6px;font-size:11px;display:none}
+#msg{display:none;padding:30px;color:#8998B8;font-size:13px}
+#hint{position:absolute;right:12px;bottom:8px;font-size:10.5px;color:#8998B8;z-index:3}
+</style></head>
+<body><div id="wrap"><canvas id="cv"></canvas>
+<div id="bar"></div><div id="hud" class="glass"></div><div id="card" class="glass"></div>
+<div id="lab" class="glass"></div><div id="tip" class="glass"></div>
+<div id="hint">Drag: orbit | Wheel: zoom | Click a part | Double-click: reset</div>
+<div id="msg">3D view unavailable (WebGL or network blocked).</div></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function(){
+const $=id=>document.getElementById(id);
+function send(t,d){window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:t},d||{}),'*')}
+send('streamlit:componentReady',{apiVersion:1});
+if(typeof THREE==='undefined'){$('msg').style.display='block';send('streamlit:setFrameHeight',{height:140});return}
+
+let S=null,C={good:'#34D399',warn:'#FBBF24',bad:'#FF4567',tele:'#22D3EE',brand:'#8B5CF6'},H=0;
+let xr='auto',fault=true,selected=null,hover=null,lastInt=0;
+const SPIN_HZ=1.1;
+const INFO={housing:['Housing and fins','Not monitored: no dedicated sensor on this part.'],
+ mounts:['Base and mounts','Not monitored. Looseness would show as high-order vibration (see Bearings).'],
+ terminal:['Terminal box','Not monitored: electrical data is not measured by this project.'],
+ rotor:['Rotor and fan','Imbalance shows at 1x the running frequency.'],
+ coupling:['Shaft and coupling','Misalignment shows at 2x the running frequency.'],
+ bearings:['Bearings','Wear or looseness shows at high orders and as impacts.']};
+
+// ---------- renderer, scene, environment ----------
+const R=new THREE.WebGLRenderer({canvas:$('cv'),antialias:true,alpha:true});
+R.setPixelRatio(Math.min(devicePixelRatio||1,2));R.outputEncoding=THREE.sRGBEncoding;
+R.toneMapping=THREE.ACESFilmicToneMapping;R.toneMappingExposure=1.1;R.shadowMap.enabled=true;R.shadowMap.type=THREE.PCFSoftShadowMap;
+const scene=new THREE.Scene(),cam=new THREE.PerspectiveCamera(32,1,.1,100);
+const pm=new THREE.PMREMGenerator(R),es=new THREE.Scene();es.background=new THREE.Color(0x05070f);
+function panel(x,y,z,w,h,d,hex,k){const m=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),new THREE.MeshBasicMaterial({color:new THREE.Color(hex).multiplyScalar(k)}));m.position.set(x,y,z);es.add(m)}
+panel(0,8,0,12,.3,6,0xffffff,5);panel(-9,2,2,.3,6,8,0x9db4ff,3);panel(9,1,-2,.3,6,8,0xc7a6ff,3);panel(0,0,-9,10,5,.3,0x22d3ee,1.6);
+scene.environment=pm.fromScene(es,.03).texture;
+const key=new THREE.DirectionalLight(0xffffff,1.0);key.position.set(5,9,6);key.castShadow=true;key.shadow.mapSize.set(1024,1024);
+Object.assign(key.shadow.camera,{left:-9,right:9,top:9,bottom:-9,near:1,far:30});scene.add(key);
+const rim=new THREE.PointLight(0x22d3ee,1.6,30);rim.position.set(-5,2,-4);scene.add(rim);
+scene.add(new THREE.AmbientLight(0x8899bb,.25));
+
+// ---------- materials and helpers ----------
+const MK={casing:()=>new THREE.MeshStandardMaterial({color:0x39425e,metalness:.75,roughness:.42}),
+ steel:()=>new THREE.MeshStandardMaterial({color:0x8d98b3,metalness:1,roughness:.28}),
+ dark:()=>new THREE.MeshStandardMaterial({color:0x151a2b,metalness:.6,roughness:.55}),
+ copper:()=>new THREE.MeshStandardMaterial({color:0xb4703a,metalness:1,roughness:.32}),
+ chrome:()=>new THREE.MeshStandardMaterial({color:0xe3e9f7,metalness:1,roughness:.12}),
+ rubber:()=>new THREE.MeshStandardMaterial({color:0x0c0e16,metalness:0,roughness:.9})};
+const tints={rotor:[],coupling:[],bearings:[]},shell=[],halos={rotor:[],coupling:[],bearings:[]};
+function mesh(geo,kind,comp,sh){const m=MK[kind]();const o=new THREE.Mesh(geo,m);o.castShadow=o.receiveShadow=true;o.userData.comp=comp;
+ if(tints[comp])tints[comp].push(m);if(sh){m.transparent=true;shell.push(m)}return o}
+function cylX(r1,r2,len,kind,comp,x,par,sh){const o=mesh(new THREE.CylinderGeometry(r1,r2,len,48),kind,comp,sh);o.rotation.z=Math.PI/2;o.position.x=x;par.add(o);return o}
+function box(w,h,d,kind,comp,x,y,z,par,sh){const o=mesh(new THREE.BoxGeometry(w,h,d),kind,comp,sh);o.position.set(x,y,z);par.add(o);return o}
+const motor=new THREE.Group(),spin=new THREE.Group();motor.add(spin);scene.add(motor);
+
+// housing
+cylX(1.15,1.15,3.3,'casing','housing',0,motor,1);
+for(let i=0;i<14;i++)cylX(1.23,1.23,.05,'casing','housing',-1.5+i*.23,motor,1);
+for(let i=0;i<30;i++){const a=i*Math.PI*2/30,o=box(3.2,.16,.07,'casing','housing',0,Math.cos(a)*1.2,Math.sin(a)*1.2,motor,1);o.rotation.x=a}
+cylX(1.22,1.22,.45,'casing','housing',1.9,motor,1);cylX(1.18,1.18,.4,'casing','housing',-1.95,motor,1);
+for(let i=0;i<8;i++){const a=i*Math.PI/4,o=cylX(.06,.06,.12,'chrome','housing',2.15,motor,1);o.position.set(2.15,Math.cos(a)*1.05,Math.sin(a)*1.05)}
+cylX(1.15,1.0,.9,'casing','housing',-2.85,motor,1);
+[.35,.7,1.0].forEach(r=>{const o=mesh(new THREE.TorusGeometry(r,.025,8,48),'steel','housing',1);o.rotation.y=Math.PI/2;o.position.x=-3.3;motor.add(o)});
+for(let i=0;i<6;i++){const o=box(.04,2.1,.04,'steel','housing',-3.3,0,0,motor,1);o.rotation.x=i*Math.PI/6}
+// terminal box, eyebolt, nameplate
+box(.95,.55,.85,'casing','terminal',-.3,1.45,0,motor);box(.8,.06,.7,'steel','terminal',-.3,1.76,0,motor);
+const gl=mesh(new THREE.CylinderGeometry(.12,.12,.3,24),'chrome','terminal');gl.rotation.x=Math.PI/2;gl.position.set(-.3,1.45,.55);motor.add(gl);
+const eye=mesh(new THREE.TorusGeometry(.14,.03,10,24),'chrome','housing');eye.position.set(.7,1.3,0);motor.add(eye);
+const cn=document.createElement('canvas');cn.width=256;cn.height=112;const cx=cn.getContext('2d');cx.fillStyle='#cfd6e6';cx.fillRect(0,0,256,112);
+cx.fillStyle='#10192e';cx.font='bold 20px sans-serif';cx.fillText('SENTINELEDGE M-01',14,32);cx.font='15px sans-serif';
+cx.fillText('3 ph | 1500 rpm | simulated',14,62);cx.fillText('Class F | IP55',14,88);
+const np=new THREE.Mesh(new THREE.BoxGeometry(1.1,.5,.03),new THREE.MeshStandardMaterial({map:new THREE.CanvasTexture(cn),metalness:.6,roughness:.4}));
+np.position.set(.4,0,1.31);motor.add(np);
+// base and mounts
+box(4.9,.14,2.7,'dark','mounts',0,-1.58,0,motor);
+[-1.5,1.5].forEach(sx=>[-.95,.95].forEach(sz=>{box(1.0,.35,.42,'casing','mounts',sx,-1.3,sz,motor);
+ [-.3,.3].forEach(dx=>{const b=mesh(new THREE.CylinderGeometry(.06,.06,.1,16),'chrome','mounts');b.position.set(sx+dx,-1.1,sz);motor.add(b)})}));
+// bearings
+cylX(.62,.7,.45,'steel','bearings',2.3,motor);cylX(.6,.6,.35,'steel','bearings',-2.3,motor);
+// rotating assembly
+cylX(.2,.2,5.7,'chrome','coupling',.25,spin);
+cylX(.95,.95,2.2,'dark','rotor',0,spin);
+for(let i=0;i<8;i++)cylX(.97,.97,.03,'steel','rotor',-1+i*.28,spin);
+[-1.25,1.25].forEach(x=>cylX(.9,.9,.3,'copper','rotor',x,spin));
+cylX(.3,.3,.2,'steel','rotor',-2.6,spin);
+for(let i=0;i<8;i++){const g=new THREE.Group();g.rotation.x=i*Math.PI/4;g.position.x=-2.6;spin.add(g);
+ const b=box(.1,.5,.3,'dark','rotor',0,.55,0,g);b.rotation.z=.25}
+cylX(.45,.45,.45,'steel','coupling',3.15,spin);cylX(.43,.43,.18,'rubber','coupling',3.5,spin);
+cylX(.45,.45,.45,'steel','coupling',3.85,spin);cylX(.2,.2,.9,'chrome','coupling',4.5,spin);
+for(let i=0;i<6;i++){const a=i*Math.PI/3,b=box(.1,.1,.1,'chrome','coupling',3.15,Math.cos(a)*.4,Math.sin(a)*.4,spin)}
+// halos (fault pulses)
+function halo(id,x,r){const m=new THREE.Mesh(new THREE.TorusGeometry(r,.045,12,64),new THREE.MeshBasicMaterial({color:0xff4567,transparent:true,opacity:0,
+ depthWrite:false,blending:THREE.AdditiveBlending}));m.rotation.y=Math.PI/2;m.position.x=x;motor.add(m);halos[id].push(m)}
+halo('rotor',0,1.45);halo('coupling',3.5,.75);halo('bearings',2.3,.85);halo('bearings',-2.3,.85);
+// floor
+const floor=new THREE.Mesh(new THREE.PlaneGeometry(40,40),new THREE.ShadowMaterial({opacity:.35}));floor.rotation.x=-Math.PI/2;floor.position.y=-1.66;floor.receiveShadow=true;scene.add(floor);
+const ringM=new THREE.MeshBasicMaterial({color:0x22d3ee,transparent:true,opacity:.55});
+[3.6,4.4].forEach((r,i)=>{const t=new THREE.Mesh(new THREE.TorusGeometry(r,.012,8,128),ringM.clone());t.rotation.x=Math.PI/2;t.position.set(1,-1.65,0);t.material.opacity=.5-i*.25;scene.add(t);floor.userData['r'+i]=t});
+
+// ---------- camera ----------
+const cv={az:.75,pol:1.2,rad:12,tx:1}, ct=Object.assign({},cv);
+const VIEWS={Overview:{az:.75,pol:1.2,rad:12,tx:1},'DE side':{az:1.25,pol:1.3,rad:7.5,tx:2.6},'NDE side':{az:-1.25,pol:1.3,rad:7.5,tx:-2.4},Top:{az:.2,pol:.25,rad:11,tx:1}};
+const bar=$('bar');
+Object.keys(VIEWS).forEach(n=>{const b=document.createElement('div');b.className='b';b.textContent=n;b.onclick=()=>{Object.assign(ct,VIEWS[n]);lastInt=performance.now()};bar.appendChild(b)});
+const bx=document.createElement('div'),bf=document.createElement('div');bx.className=bf.className='b';bar.appendChild(bx);bar.appendChild(bf);
+function labels(){bx.textContent='X-ray: '+xr;bx.classList.toggle('on',xr!=='off');bf.textContent='Fault map: '+(fault?'on':'off');bf.classList.toggle('on',fault)}
+bx.onclick=()=>{xr={auto:'on',on:'off',off:'auto'}[xr];labels()};bf.onclick=()=>{fault=!fault;labels()};labels();
+
+// ---------- interaction ----------
+const cvs=$('cv'),ray=new THREE.Raycaster(),mouse=new THREE.Vector2();let drag=false,px=0,py=0,moved=0;
+function pick(e){const r=cvs.getBoundingClientRect();mouse.set((e.clientX-r.left)/r.width*2-1,-((e.clientY-r.top)/r.height)*2+1);ray.setFromCamera(mouse,cam);
+ const h=ray.intersectObjects(motor.children,true).find(x=>x.object.userData.comp);return h?h.object.userData.comp:null}
+cvs.addEventListener('pointerdown',e=>{drag=true;moved=0;px=e.clientX;py=e.clientY;cvs.setPointerCapture(e.pointerId);cvs.style.cursor='grabbing'});
+cvs.addEventListener('pointermove',e=>{lastInt=performance.now();
+ if(drag){const dx=e.clientX-px,dy=e.clientY-py;moved+=Math.abs(dx)+Math.abs(dy);ct.az-=dx*.008;ct.pol=Math.max(.15,Math.min(1.65,ct.pol-dy*.006));px=e.clientX;py=e.clientY;cv.az=ct.az;cv.pol=ct.pol}
+ else{hover=pick(e);const t=$('tip');if(hover){t.style.display='block';t.textContent=INFO[hover][0];t.style.left=(e.offsetX+14)+'px';t.style.top=(e.offsetY+14)+'px';cvs.style.cursor='pointer'}else{t.style.display='none';cvs.style.cursor='grab'}}});
+cvs.addEventListener('pointerup',e=>{drag=false;cvs.style.cursor='grab';if(moved<5){selected=pick(e);showCard()}});
+cvs.addEventListener('wheel',e=>{e.preventDefault();ct.rad=Math.max(5,Math.min(18,ct.rad*(1+e.deltaY*.001)));lastInt=performance.now()},{passive:false});
+cvs.addEventListener('dblclick',()=>{Object.assign(ct,VIEWS.Overview);selected=null;showCard()});
+
+function pct(v){return Math.round(v*100)+' %'}
+function showCard(){const c=$('card');if(!selected||!S){c.style.display='none';return}
+ const i=INFO[selected],d=S.comps[selected];let t='<b>'+i[0]+'</b>';
+ if(d){const col=d.s<.15?C.good:d.s<.45?C.warn:C.bad;t+=' <span style="color:'+col+';font-weight:700">'+(d.s<.15?'Normal':'Suspect '+pct(d.s))+'</span><br>'+d.fault+'<br><span style="color:#8998B8">'+d.why+'</span>'}
+ else t+='<br><span style="color:#8998B8">'+i[1]+'</span>';
+ c.innerHTML=t;c.style.display='block'}
+
+// ---------- state from Streamlit ----------
+const cur={ratio:1,order:1,rotor:0,coupling:0,bearings:0,xray:0},tgt={ratio:1,order:1,rotor:0,coupling:0,bearings:0};
+function apply(){const s=S;if(!s)return;C=s.colors;
+ tgt.ratio=s.ratio;tgt.order=isFinite(s.order)?s.order:1;['rotor','coupling','bearings'].forEach(k=>tgt[k]=s.comps[k].s);
+ const lc=s.level==='CRITIQUE'?C.bad:s.level==='ATTENTION'?C.warn:C.good;
+ rim.color.set(lc);Object.keys(floor.userData).forEach(k=>floor.userData[k].material.color.set(lc));
+ const rpm=isFinite(s.f0)?Math.round(s.f0*60)+' rpm':'n/a';
+ $('hud').innerHTML='<span class="lv" style="background:'+lc+'22;color:'+lc+';border:1px solid '+lc+'">'+s.level_en+'</span>'+(s.simulated?' <span class="k">simulated</span>':'')+
+ '<br><span class="k">Vibration</span> <b>'+s.std.toFixed(3)+' g</b> <span class="k">(x'+s.ratio.toFixed(1)+')</span>'+
+ '<br><span class="k">Frequency</span> <b>'+(s.freq>0?s.freq.toFixed(1)+' Hz':'n/a')+'</b>'+(isFinite(s.order)?' <span class="k">('+s.order.toFixed(1)+'x)</span>':'')+
+ '<br><span class="k">Speed (assumed)</span> <b>'+rpm+'</b><br><span class="k">Health</span> <b>'+Math.round(s.health)+' / 100</b>'+
+ '<br><span class="k">Anomaly score</span> <b>'+s.score.toFixed(3)+'</b>';
+ if(H!==s.height){H=s.height;send('streamlit:setFrameHeight',{height:H});resize()}
+ showCard()}
+window.addEventListener('message',e=>{if(e.data&&e.data.type==='streamlit:render'){S=e.data.args.state;apply()}});
+
+function resize(){const w=$('wrap').clientWidth||600,h=$('wrap').clientHeight||H||500;R.setSize(w,h,false);cam.aspect=w/h;cam.updateProjectionMatrix()}
+new ResizeObserver(resize).observe($('wrap'));resize();
+
+// ---------- animation ----------
+const col=new THREE.Color(),anch={rotor:[0,1.6,0],coupling:[3.5,.85,0],bearings:[2.3,1.0,0]},v3=new THREE.Vector3();
+let t=0,spinA=0,lastT=performance.now();
+function frame(now){requestAnimationFrame(frame);const dt=Math.min((now-lastT)/1000,.05);lastT=now;t+=dt;const k=Math.min(1,dt*3.5);
+ for(const q in tgt)cur[q]+=(tgt[q]-cur[q])*k;
+ spinA+=dt*Math.PI*2*SPIN_HZ;spin.rotation.x=spinA;
+ // vibration shaped by the suspected fault
+ const amp=.004+.011*Math.min(cur.ratio,12),wR=cur.rotor,wC=cur.coupling,wB=cur.bearings,gen=Math.max(0,1-(wR+wC+wB)*2);
+ let dx=0,dy=0,dz=0;
+ dy+=amp*wR*Math.cos(spinA);dz+=amp*wR*Math.sin(spinA);
+ dx+=amp*wC*1.4*Math.sin(2*spinA);dy+=amp*wC*.5*Math.sin(2*spinA+1);
+ const j=amp*wB*1.3;dx+=(Math.random()-.5)*j;dy+=(Math.random()-.5)*j*1.2;dz+=(Math.random()-.5)*j;
+ if(wB>.2&&Math.random()<.1*wB)dy+=amp*wB*2.2;
+ dy+=gen*amp*.7*Math.sin(cur.order*spinA);dz+=gen*amp*.35*Math.cos(cur.order*spinA);
+ motor.position.set(dx,dy,dz);
+ // fault map: heat tint and pulsing halos
+ let maxS=0,top=null;
+ ['rotor','coupling','bearings'].forEach(id=>{const s=cur[id];if(s>maxS){maxS=s;top=id}
+  const on=fault&&s>.12;col.set(s<.45?C.warn:C.bad);
+  tints[id].forEach(m=>{m.emissive.copy(col);m.emissiveIntensity=on?s*(.9+.5*Math.sin(t*5)):0});
+  halos[id].forEach(h=>{h.material.color.copy(col);h.material.opacity=on&&s>.25?s*(.45+.3*Math.sin(t*4)):0})});
+ // x-ray: housing becomes translucent to show internals
+ const want=xr==='on'?1:xr==='off'?0:(maxS>.3?1:0);cur.xray+=(want-cur.xray)*k;const op=1-.86*cur.xray;
+ shell.forEach(m=>{m.opacity=op;m.depthWrite=op>.99});
+ // camera
+ if(now-lastInt>7000&&Math.abs(ct.tx-VIEWS.Overview.tx)<.01)ct.az+=dt*.06;
+ for(const q of['az','pol','rad','tx'])cv[q]+=(ct[q]-cv[q])*Math.min(1,dt*4);
+ cam.position.set(cv.tx+cv.rad*Math.sin(cv.pol)*Math.sin(cv.az),cv.rad*Math.cos(cv.pol),cv.rad*Math.sin(cv.pol)*Math.cos(cv.az));cam.lookAt(cv.tx,-.2,0);
+ // callout on the main suspect
+ const lab=$('lab');
+ if(fault&&top&&maxS>.25&&S){v3.set(...anch[top]);motor.localToWorld(v3);v3.project(cam);const w=$('wrap').clientWidth,h=$('wrap').clientHeight;
+  const c=maxS<.45?C.warn:C.bad;lab.style.display='block';lab.style.color=c;lab.style.borderColor=c;
+  lab.textContent=S.comps[top].name+' | '+pct(maxS);lab.style.transform='translate('+((v3.x*.5+.5)*w)+'px,'+((-v3.y*.5+.5)*h)+'px) translate(-50%,-130%)'}
+ else lab.style.display='none';
+ R.render(scene,cam)}
+requestAnimationFrame(frame);
+})();
+</script></body></html>
